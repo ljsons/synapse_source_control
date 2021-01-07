@@ -1,0 +1,229 @@
+{
+	"name": "Exercise 5 - Model Training",
+	"properties": {
+		"nbformat": 4,
+		"nbformat_minor": 2,
+		"bigDataPool": {
+			"referenceName": "SparkPool01",
+			"type": "BigDataPoolReference"
+		},
+		"sessionProperties": {
+			"driverMemory": "28g",
+			"driverCores": 4,
+			"executorMemory": "28g",
+			"executorCores": 4,
+			"numExecutors": 2
+		},
+		"metadata": {
+			"language_info": {
+				"name": "python"
+			},
+			"a365ComputeOptions": {
+				"id": "/subscriptions/1f74c10a-1e66-4345-96da-1ba41a078f87/resourceGroups/Synapse-AIAD-283598/providers/Microsoft.Synapse/workspaces/asaworkspace283598/bigDataPools/SparkPool01",
+				"name": "SparkPool01",
+				"type": "Spark",
+				"endpoint": "https://asaworkspace283598.dev.azuresynapse.net/livyApi/versions/2019-11-01-preview/sparkPools/SparkPool01",
+				"auth": {
+					"type": "AAD",
+					"authResource": "https://dev.azuresynapse.net"
+				},
+				"sparkVersion": "2.4",
+				"nodeCount": 3,
+				"cores": 4,
+				"memory": 28
+			}
+		},
+		"cells": [
+			{
+				"cell_type": "markdown",
+				"source": [
+					"# Model training and registration\n",
+					"This notebook show the process for training the model, converting the model to ONNX and uploading the ONNX model to Azure Storage."
+				]
+			},
+			{
+				"cell_type": "markdown",
+				"source": [
+					"## Explore the training data\n",
+					"The following cells load the source CSV file into a Spark DataFrame and create a temporary view that can be used to query the data with Spark SQL.\n",
+					""
+				]
+			},
+			{
+				"cell_type": "code",
+				"source": [
+					"df = spark.read.load('abfss://dev@asadatalake283598.dfs.core.windows.net/bronze/wwi-factsale.csv', format=\"csv\"\n",
+					"## If header exists uncomment line bellow\n",
+					", header=True, sep=\"|\"\n",
+					")"
+				],
+				"attachments": null,
+				"execution_count": 3
+			},
+			{
+				"cell_type": "code",
+				"source": [
+					"df.createOrReplaceTempView(\"facts\")"
+				],
+				"execution_count": 4
+			},
+			{
+				"cell_type": "code",
+				"source": [
+					"display(spark.sql(\"SELECT * FROM facts WHERE `Customer Key` == '11' ORDER BY `Stock Item Key`\"))"
+				],
+				"execution_count": 5
+			},
+			{
+				"cell_type": "markdown",
+				"source": [
+					"## Predict Quantity given Customer Key and Stock Item Key\n",
+					"In the following cells we load a subset of the data that just contains the fields needed for training. \n",
+					"\n",
+					""
+				]
+			},
+			{
+				"cell_type": "code",
+				"source": [
+					"from pyspark.sql.functions import col\n",
+					"df3 = spark.sql(\"SELECT double(`Customer Key`) as customerkey, double(`Stock Item Key`) as stockitemkey, double(`Quantity`) as quantity FROM facts\").where(col(\"quantity\").isNotNull())\n",
+					"df3.cache()"
+				],
+				"execution_count": 6
+			},
+			{
+				"cell_type": "markdown",
+				"source": [
+					"Next, we package the data into the format expected by SPark ML's LinearRegression. It requires a DataFrame with two columns- `features` and a column with the labels to predict (`quantity` in this case).\n",
+					""
+				]
+			},
+			{
+				"cell_type": "code",
+				"source": [
+					"from pyspark.ml.feature import VectorAssembler\n",
+					"\n",
+					"vectorAssembler = VectorAssembler(inputCols = ['customerkey', 'stockitemkey'], outputCol = 'features')\n",
+					"df4 = vectorAssembler.transform(df3)\n",
+					"df5 = df4.select(['features', 'quantity'])\n",
+					"df5.show(10)"
+				],
+				"execution_count": 8
+			},
+			{
+				"cell_type": "markdown",
+				"source": [
+					"Now, we split our DataFrame into training and testing DataFrames.\n",
+					""
+				]
+			},
+			{
+				"cell_type": "code",
+				"source": [
+					"trainingFraction = 0.7\n",
+					"testingFraction = (1-trainingFraction)\n",
+					"seed = 42\n",
+					"\n",
+					"# Split the dataframe into test and training dataframes\n",
+					"df_train, df_test = df5.randomSplit([trainingFraction, testingFraction], seed=seed)"
+				],
+				"execution_count": 9
+			},
+			{
+				"cell_type": "markdown",
+				"source": [
+					"In the following cell, we train our LinearRegression model.\n",
+					""
+				]
+			},
+			{
+				"cell_type": "code",
+				"source": [
+					"from pyspark.ml.regression import LinearRegression\n",
+					"\n",
+					"lin_reg = LinearRegression(featuresCol = 'features', labelCol='quantity', maxIter = 10, regParam=0.3)\n",
+					"lin_reg_model = lin_reg.fit(df_train)\n",
+					"\n",
+					"print(\"Coefficients: \" + str(lin_reg_model.coefficients))\n",
+					"print(\"Intercept: \" + str(lin_reg_model.intercept))"
+				],
+				"execution_count": 10
+			},
+			{
+				"cell_type": "markdown",
+				"source": [
+					"With a trained model in hand, we can use it to make predictions against the test DataFrame.\n",
+					""
+				]
+			},
+			{
+				"cell_type": "code",
+				"source": [
+					"df_pred = lin_reg_model.transform(df_test)\n",
+					"display(df_pred)"
+				],
+				"execution_count": 11
+			},
+			{
+				"cell_type": "markdown",
+				"source": [
+					"## Convert model to ONNX\n",
+					"In the cells that follow, we convert the model to ONNX and show how an output of how ONNX represents the Spark ML model.\n",
+					""
+				]
+			},
+			{
+				"cell_type": "code",
+				"source": [
+					"from onnxmltools import convert_sparkml\n",
+					"from onnxmltools.convert.common.data_types import FloatTensorType\n",
+					"\n",
+					"initial_types = [ \n",
+					"    (\"features\", FloatTensorType([1, lin_reg_model.numFeatures])),\n",
+					"    # (repeat for the required inputs)\n",
+					"]"
+				],
+				"execution_count": 13
+			},
+			{
+				"cell_type": "code",
+				"source": [
+					"model_onnx = convert_sparkml(lin_reg_model, 'sparkml GeneralizedLinearRegression', initial_types)\n",
+					"model_onnx"
+				],
+				"execution_count": 14
+			},
+			{
+				"cell_type": "markdown",
+				"source": [
+					"## Upload the model to Azure Storage\n",
+					"In the cells that follow we save the ONNX model to the storage of Spark driver node temporarily. Then we use the Azure Storage Python SDK to upload the ONNX model to Azure Storage.\n",
+					""
+				]
+			},
+			{
+				"cell_type": "code",
+				"source": [
+					"with open(\"model.onnx\", \"wb\") as f:\n",
+					"    f.write(model_onnx.SerializeToString())"
+				],
+				"execution_count": 15
+			},
+			{
+				"cell_type": "code",
+				"source": [
+					"connection_string = \"DefaultEndpointsProtocol=https;AccountName=asastore283598;AccountKey=P+fFP2eBwH0gKB2h5Who19BO9Q2TRsYLNEbH7ClF3+Rtx0e8XT+ooMbhZbRa49rWgeUaqkv1Owbiml6JVTwJEQ==;EndpointSuffix=core.windows.net\"\n",
+					"\n",
+					"from azure.storage.blob import BlobClient\n",
+					"\n",
+					"blob = BlobClient.from_connection_string(conn_str=connection_string, container_name=\"models\", blob_name=\"onnx/model.onnx\")\n",
+					"\n",
+					"with open(\"./model.onnx\", \"rb\") as data:\n",
+					"    blob.upload_blob(data,overwrite=True)"
+				],
+				"execution_count": 18
+			}
+		]
+	}
+}
